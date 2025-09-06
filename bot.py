@@ -9,6 +9,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
+from flask import Flask, jsonify
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -20,10 +21,10 @@ BINANCE_API_BASE = os.getenv("BINANCE_API_BASE", "https://api.binance.com")
 EXCHANGE_INFO = BINANCE_API_BASE + "/api/v3/exchangeInfo"
 TICKER_ALL = BINANCE_API_BASE + "/api/v3/ticker/price"
 TG_API_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-SYMBOL_TTL = 60 * 5
+SYMBOL_TTL = int(os.getenv("SYMBOL_REFRESH_SECONDS", "300"))
 PRICE_REFRESH_SECONDS = int(os.getenv("PRICE_REFRESH_SECONDS", "5"))
-SYMBOL_REFRESH_SECONDS = int(os.getenv("SYMBOL_REFRESH_SECONDS", "300"))
 CHECK_INTERVAL = PRICE_REFRESH_SECONDS
+PORT = int(os.getenv("PORT", "8080"))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("crybot")
 session = requests.Session()
@@ -40,7 +41,14 @@ class AlertsDB:
     def _init_db(self):
         with self._lock, self._conn() as conn:
             c = conn.cursor()
-            c.execute("CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER, symbol TEXT NOT NULL, base_asset TEXT NOT NULL, target REAL NOT NULL, direction TEXT NOT NULL, created_at INTEGER NOT NULL)")
+            c.execute("CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER, symbol TEXT NOT NULL, target REAL NOT NULL, direction TEXT NOT NULL, created_at INTEGER NOT NULL)")
+            c.execute("PRAGMA table_info(alerts)")
+            cols = [row[1] for row in c.fetchall()]
+            if "base_asset" not in cols:
+                try:
+                    c.execute("ALTER TABLE alerts ADD COLUMN base_asset TEXT")
+                except Exception:
+                    pass
             conn.commit()
     def add_alert(self, chat_id: int, user_id: int, symbol: str, base_asset: str, target: float, direction: str) -> int:
         with self._lock, self._conn() as conn:
@@ -57,15 +65,20 @@ class AlertsDB:
     def list_alerts_for_chat(self, chat_id: int) -> List[Dict]:
         with self._lock, self._conn() as conn:
             c = conn.cursor()
-            c.execute("SELECT id,symbol,base_asset,target,direction,created_at FROM alerts WHERE chat_id=? ORDER BY id DESC",(chat_id,))
+            c.execute("SELECT id,symbol,COALESCE(base_asset, UPPER(symbol)),target,direction,created_at FROM alerts WHERE chat_id=? ORDER BY id DESC",(chat_id,))
             rows = c.fetchall()
             return [{"id":r[0],"symbol":r[1],"base_asset":r[2],"target":r[3],"direction":r[4],"created_at":r[5]} for r in rows]
     def get_all_alerts(self) -> List[Dict]:
         with self._lock, self._conn() as conn:
             c = conn.cursor()
-            c.execute("SELECT id,chat_id,user_id,symbol,base_asset,target,direction,created_at FROM alerts ORDER BY id ASC")
-            rows = c.fetchall()
-            return [{"id":r[0],"chat_id":r[1],"user_id":r[2],"symbol":r[3],"base_asset":r[4],"target":r[5],"direction":r[6],"created_at":r[7]} for r in rows]
+            try:
+                c.execute("SELECT id,chat_id,user_id,symbol,base_asset,target,direction,created_at FROM alerts ORDER BY id ASC")
+                rows = c.fetchall()
+                return [{"id":r[0],"chat_id":r[1],"user_id":r[2],"symbol":r[3],"base_asset":(r[4] if r[4] else r[3].upper()),"target":r[5],"direction":r[6],"created_at":r[7]} for r in rows]
+            except Exception:
+                c.execute("SELECT id,chat_id,user_id,symbol,target,direction,created_at FROM alerts ORDER BY id ASC")
+                rows = c.fetchall()
+                return [{"id":r[0],"chat_id":r[1],"user_id":r[2],"symbol":r[3],"base_asset":r[3].upper(),"target":r[4],"direction":r[5],"created_at":r[6]} for r in rows]
 
 db = AlertsDB("data.db")
 _symbol_map: Dict[str, str] = {}
@@ -148,11 +161,9 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_in = context.args[0].strip()
     refresh_symbol_map()
-    base = user_in.upper() if user_in.upper() in _symbol_map else user_in.lower()
-    if base.upper() in _symbol_map:
-        price = get_price_for_base(base)
-    else:
-        price = get_price_for_base(user_in)
+    base_key = user_in.upper()
+    base_asset = base_key if base_key in _symbol_map else user_in.upper()
+    price = get_price_for_base(base_asset)
     if price is None:
         await update.message.reply_text("Price not available")
     else:
@@ -174,8 +185,8 @@ async def cmd_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid target")
         return
     refresh_symbol_map()
-    base = user_in.upper() if user_in.upper() in _symbol_map else user_in.lower()
-    base_asset = base.upper()
+    base_key = user_in.upper()
+    base_asset = base_key if base_key in _symbol_map else user_in.upper()
     if base_asset not in _symbol_map:
         await update.message.reply_text("Unknown or unsupported symbol on Binance")
         return
@@ -236,7 +247,17 @@ def check_loop_sync():
             logger.exception("check_loop_sync error")
         time.sleep(CHECK_INTERVAL)
 
+flask_app = Flask("crybot_health")
+@flask_app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status":"ok"})
+
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=PORT, threaded=True)
+
 def main():
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
     checker = threading.Thread(target=check_loop_sync, daemon=True)
     checker.start()
     app = ApplicationBuilder().token(TOKEN).build()
